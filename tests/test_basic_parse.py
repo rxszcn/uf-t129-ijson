@@ -1,6 +1,7 @@
 """Tests for the ijson.basic_parse method"""
 
 import itertools
+import json
 import sys
 import threading
 from decimal import Decimal
@@ -56,6 +57,61 @@ def test_surrogate_pairs(adaptor):
     event = adaptor.basic_parse(SURROGATE_PAIRS_JSON)[0]
     parsed_string = event[1]
     assert '💩' == parsed_string
+
+
+# A string long enough to span many 64KB-sized input chunks; this is the shape
+# of input whose cross-chunk continuation used to be re-scanned from the
+# opening quote on every chunk, producing quadratic parsing time.
+_LONG_STRING_LENGTH = 300 * 1024
+
+
+def _string_events(adaptor, payload, buf_size):
+    return [value for event, value
+            in adaptor.basic_parse(payload, buf_size=buf_size)
+            if event == 'string']
+
+
+@pytest.mark.pull_only
+@pytest.mark.parametrize("buf_size", [1, 3, 16, 64, 4096, 65536])
+def test_long_string_spanning_chunks(adaptor, buf_size):
+    text = 'a' * _LONG_STRING_LENGTH
+    payload = json.dumps({'big': text}).encode('utf-8')
+    assert _string_events(adaptor, payload, buf_size) == [text]
+
+
+@pytest.mark.pull_only
+@pytest.mark.parametrize("buf_size", [1, 3, 16, 64, 4096, 65536])
+def test_long_string_with_escaped_quotes(adaptor, buf_size):
+    # Periodic escaped quotes force the lexer to repeatedly distinguish a real
+    # closing quote from an escaped one across chunk boundaries.
+    text = ('x' * 1000 + '"') * 300
+    payload = json.dumps({'big': text}).encode('utf-8')
+    assert _string_events(adaptor, payload, buf_size) == [text]
+
+
+@pytest.mark.pull_only
+@pytest.mark.parametrize("n_backslashes", [1, 2, 3, 4, 7, 8])
+@pytest.mark.parametrize("buf_size", [1, 2, 3, 64, 65536])
+def test_backslash_parity_across_chunk_boundary(adaptor, n_backslashes, buf_size):
+    # Pad so the backslash run lands on (or straddles) a chunk boundary.
+    pad = 'a' * (buf_size - 2 if buf_size > 2 else 1)
+    text = pad + ('\\' * n_backslashes) + '"z'
+    payload = json.dumps({'s': text}).encode('utf-8')
+    assert _string_events(adaptor, payload, buf_size) == [text]
+
+
+@pytest.mark.pull_only
+def test_long_string_followed_by_more_content(adaptor):
+    # The data buffered while scanning the long string must not cause the
+    # lexemes following the closing quote to be dropped or duplicated.
+    text = 'a' * _LONG_STRING_LENGTH
+    payload = json.dumps({'big': text, 'tail': 42, 'k': 'v'}).encode('utf-8')
+    events = adaptor.basic_parse(payload, buf_size=65536)
+    assert ('string', text) in events
+    assert ('number', 42) in events
+    assert ('map_key', 'k') in events
+    assert ('string', 'v') in events
+    assert events[-1] == ('end_map', None)
 
 
 def test_embedded_nul(adaptor):

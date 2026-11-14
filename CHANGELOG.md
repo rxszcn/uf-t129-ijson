@@ -2,6 +2,13 @@
 
 ## Development
 
+* The `python` backend's lexer no longer re-scans a string from its opening
+  quote on every new input chunk when the string spans several chunks. It keeps
+  the pending chunks in a list and advances a forward-only cursor instead, so
+  parsing a single long string is now linear in its length rather than
+  quadratic. The parity of backslashes preceding a quote is still computed
+  across chunk boundaries, preserving escaped-quote and token-boundary
+  semantics, and the emitted event sequence is unchanged for normal documents.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

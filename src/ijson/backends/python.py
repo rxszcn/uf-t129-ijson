@@ -75,26 +75,109 @@ def Lexer(target):
             lexeme = match.group()
             if lexeme == '"':
                 pos = match.start()
+                quote_start = pos
                 start = pos + 1
                 while True:
                     try:
                         end = buf.index('"', start)
                         escpos = end - 1
-                        while buf[escpos] == '\\':
+                        while escpos >= 0 and buf[escpos] == '\\':
                             escpos -= 1
                         if (end - escpos) % 2 == 0:
                             start = end + 1
                         else:
                             break
                     except ValueError:
+                        # The closing quote is not in the data seen so far.
+                        # Resume scanning on the next chunk instead of searching
+                        # again from the opening quote: re-scanning the whole
+                        # string on every new chunk made a single long string
+                        # quadratic in its length. The chunks are kept in a list
+                        # (rather than concatenated onto ``buf``) so appending
+                        # another chunk is O(chunk size) instead of O(string
+                        # size).
                         try:
                             data = (yield)
                         except GeneratorExit:
                             data = ''
                         if not data:
                             raise common.IncompleteJSONError('Incomplete string lexeme')
-                        buf += data
-                send((discarded + pos, buf[pos:end + 1]))
+                        # A chunk list whose first element is the whole current
+                        # buffer (so the unconsumed prefix before the opening
+                        # quote is preserved verbatim and absolute positions
+                        # stay valid once the list is joined back into ``buf``).
+                        str_chunks = [buf, data]
+                        # Scan the buffered chunks one at a time, keeping a
+                        # single relative cursor (``rel_start``) inside the
+                        # chunk under inspection. Only this cursor moves while
+                        # searching, and it always moves forward, so neither the
+                        # already-scanned prefix nor any quote is ever read
+                        # twice. ``chunk_abs`` is the absolute position of the
+                        # first character of the current chunk.
+                        rel_start = 0
+                        chunk_abs = len(buf)
+                        while True:
+                            chunk = str_chunks[-1]
+                            try:
+                                rel_end = chunk.index('"', rel_start)
+                            except ValueError:
+                                # No quote left in this chunk: ask for more data
+                                # and keep scanning forward, never backwards.
+                                try:
+                                    data = (yield)
+                                except GeneratorExit:
+                                    data = ''
+                                if not data:
+                                    raise common.IncompleteJSONError('Incomplete string lexeme')
+                                chunk_abs += len(chunk)
+                                rel_start = 0
+                                str_chunks.append(data)
+                                continue
+                            # Absolute position of this quote, used only for the
+                            # parity check across chunk boundaries and, on a real
+                            # closing quote, to locate the lexeme in the joined
+                            # buffer.
+                            end = chunk_abs + rel_end
+                            # Parity of the backslashes immediately preceding
+                            # the quote. An even count (zero included) means the
+                            # quote closes the string; an odd count means it is
+                            # escaped. Walking backwards across the chunk
+                            # boundary keeps this correct when the backslash run
+                            # itself spans two chunks.
+                            n_backslashes = 0
+                            ci = len(str_chunks) - 1
+                            cindex = rel_end - 1
+                            while ci >= 0 and cindex >= 0 and \
+                                    str_chunks[ci][cindex] == '\\':
+                                n_backslashes += 1
+                                cindex -= 1
+                                if cindex < 0 and ci > 0:
+                                    ci -= 1
+                                    cindex = len(str_chunks[ci]) - 1
+                            if n_backslashes % 2 == 1:
+                                # Escaped quote: resume after it, within this
+                                # chunk if possible, otherwise on the next one.
+                                if rel_end + 1 == len(chunk):
+                                    try:
+                                        data = (yield)
+                                    except GeneratorExit:
+                                        data = ''
+                                    if not data:
+                                        raise common.IncompleteJSONError('Incomplete string lexeme')
+                                    chunk_abs += len(chunk)
+                                    rel_start = 0
+                                    str_chunks.append(data)
+                                else:
+                                    rel_start = rel_end + 1
+                                continue
+                            # Materialize the full buffer (unconsumed prefix +
+                            # string lexeme + everything received so far) only
+                            # once, when the closing quote has finally been
+                            # found. The preserved prefix keeps the absolute
+                            # ``quote_start``/``end`` positions valid.
+                            buf = ''.join(str_chunks)
+                            break
+                send((discarded + quote_start, buf[quote_start:end + 1]))
                 pos = end + 1
             else:
                 while lexeme not in UNARY_LEXEMES and match.end() == len(buf):
